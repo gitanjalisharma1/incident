@@ -9,14 +9,18 @@ app = FastAPI(redirect_slashes=False)  # never redirect grader requests
 
 PROFILE = "ga5-incident-agent/v2"
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "")  # optional: e.g. minimal / low (leave empty if unsure)
-PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "15"))  # seconds for the whole planning step (limit per request is 18)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_THINKING = os.environ.get("GEMINI_THINKING", "low")  # set to "none" to send no thinking setting
+FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK", "gemini-3.5-flash-lite")
+PRIMARY_CAP = float(os.environ.get("PRIMARY_CAP", "9"))  # max seconds for the first model call
+PLAN_BUDGET = float(os.environ.get("PLAN_BUDGET", "13"))  # seconds for the whole planning step (limit per request is 18)
+SELFTEST_TOKEN = os.environ.get("SELFTEST_TOKEN", "")  # needed for /selftest, /selftest/models, /debug/errors
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_PATH = os.environ.get("DB_PATH", "state.db")
 P = "inc:"
 DB_LOCK = threading.Lock()
 _locks, _locks_guard = {}, threading.Lock()
+_table_ready = False
 
 
 # ---------------- persistent key-value store ----------------
@@ -24,7 +28,7 @@ def run(sql, params=(), fetch=False):
     with DB_LOCK:
         if DATABASE_URL:
             import psycopg2
-            con = psycopg2.connect(DATABASE_URL)
+            con = psycopg2.connect(DATABASE_URL, connect_timeout=5)
             try:
                 cur = con.cursor()
                 cur.execute(sql.replace("?", "%s"), params)
@@ -43,15 +47,21 @@ def run(sql, params=(), fetch=False):
             con.close()
 
 
-run("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+def ensure_table():
+    global _table_ready
+    if not _table_ready:
+        run("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+        _table_ready = True
 
 
 def kget(k):
+    ensure_table()
     rows = run("SELECT v FROM kv WHERE k=?", (P + k,), True)
     return json.loads(rows[0][0]) if rows else None
 
 
 def kput(k, v):
+    ensure_table()
     run("INSERT INTO kv (k,v) VALUES (?,?) ON CONFLICT (k) DO UPDATE SET v=excluded.v", (P + k, json.dumps(v)))
 
 
@@ -132,6 +142,24 @@ def err(code, msg):
     return JSONResponse({"error": msg}, status_code=code)
 
 
+def transcript_text(t):
+    """Turn the transcript into lines like '[evidence_id] text'."""
+    if isinstance(t, str):
+        return t
+    lines = []
+    for x in t:
+        if isinstance(x, dict):
+            i = next((x[k] for k in ("id", "evidenceId", "evidence_id", "ref") if isinstance(x.get(k), str)), None)
+            txt = next((x[k] for k in ("text", "content", "message", "line") if isinstance(x.get(k), str)), None)
+            if i is not None and txt is not None:
+                lines.append(f"[{i}] {txt}")
+            else:
+                lines.append(json.dumps(x, ensure_ascii=False))
+        else:
+            lines.append(str(x))
+    return "\n".join(lines)
+
+
 # ---------------- model planner (the only place a model is called) ----------------
 PROMPT = """You are an incident-response planner. Read the incident transcript and decide what to do.
 Return ONLY a JSON object:
@@ -153,23 +181,35 @@ Rules:
 
 def call_model(model, parts, timeout, thinking=""):
     cfg = {"responseMimeType": "application/json", "temperature": 0}
-    if thinking:
+    if thinking and thinking != "none":
         cfg["thinkingConfig"] = {"thinkingLevel": thinking}
     return requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        params={"key": GEMINI_KEY}, json={"contents": [{"parts": parts}], "generationConfig": cfg}, timeout=max(timeout, 1))
+        headers={"x-goog-api-key": GEMINI_KEY},
+        json={"contents": [{"parts": parts}], "generationConfig": cfg}, timeout=max(timeout, 1))
+
+
+def model_list():
+    primary = (GEMINI_MODEL, "" if GEMINI_THINKING == "none" else GEMINI_THINKING)
+    out = [primary]
+    if FALLBACK_MODEL and FALLBACK_MODEL != GEMINI_MODEL:
+        out.append((FALLBACK_MODEL, ""))
+    return out
 
 
 def gemini_json(parts, deadline):
     errors = []
-    for model in [GEMINI_MODEL, "gemini-flash-lite-latest"]:
+    for i, (model, th) in enumerate(model_list()):
         remaining = deadline - time.time()
         if remaining < 4:
             break
+        t = remaining - 1
+        if i == 0:
+            t = min(PRIMARY_CAP, t)  # leave room for the fallback model
         try:
-            r = call_model(model, parts, remaining - 1, GEMINI_THINKING)
-            if r.status_code == 400 and GEMINI_THINKING:
-                r = call_model(model, parts, deadline - time.time() - 1, "")  # thinking option not accepted: retry without it
+            r = call_model(model, parts, t, th)
+            if r.status_code == 400 and th:
+                r = call_model(model, parts, max(deadline - time.time() - 1, 1), "")  # thinking option not accepted
             if r.status_code != 200:
                 errors.append(f"{model} HTTP {r.status_code}")
                 continue
@@ -214,25 +254,29 @@ def validate_plan(plan, body, ids):
         rc = m[0]
     ev = []
     for e in plan.get("evidence") or []:
-        if e in ids and e not in ev:
+        if isinstance(e, str) and e in ids and e not in ev:
             ev.append(e)
     ev = ev[:4]
     if len(ev) < 2:
         raise ValueError("evidence needs 2 to 4 distinct IDs that exist in the transcript")
 
     def cite(x):
-        c = [e for e in (x.get("evidence") or []) if e in ev]
+        c = [e for e in (x.get("evidence") or []) if isinstance(e, str) and e in ev]
         return list(dict.fromkeys(c)) or list(ev)
 
     diags = []
     for d in plan.get("diagnostics") or []:
+        if not isinstance(d, dict):
+            raise ValueError("each diagnostic must be an object")
         t = d.get("toolName")
         if t not in catalog or t in effect_tools:
             raise ValueError(f"diagnostic tool {t} must be a non-effect tool from the catalog")
         diags.append({"toolName": t, "arguments": clean_args(t, d.get("arguments"), schemas), "evidence": cite(d)})
     if not 1 <= len(diags) <= max_diag:
         raise ValueError(f"need between 1 and {max_diag} diagnostics")
-    eff = plan.get("effect") or {}
+    eff = plan.get("effect")
+    if not isinstance(eff, dict):
+        raise ValueError("effect must be an object")
     et = eff.get("toolName")
     if et not in effect_tools or et not in catalog:
         raise ValueError("effect must be exactly one tool from policy.effectTools")
@@ -242,10 +286,7 @@ def validate_plan(plan, body, ids):
 
 def plan_incident(body, secrets_):
     inc, pol = body["incident"], body["policy"]
-    transcript = inc["transcript"]
-    if isinstance(transcript, list):
-        transcript = "\n".join(str(x) for x in transcript)
-    transcript = scrub(str(transcript), secrets_)
+    transcript = scrub(transcript_text(inc["transcript"]), secrets_)
     ids = set(re.findall(r"(?m)^\s*\[([^\]\n]+)\]", transcript))
     data = {
         "incident": {k: inc.get(k) for k in ("incidentId", "title", "service", "severity", "allowedRootCauses")},
@@ -262,8 +303,8 @@ def plan_incident(body, secrets_):
         raw, model = gemini_json(p, deadline)
         try:
             return validate_plan(raw, body, ids), model
-        except ValueError as e:
-            last_err = str(e)
+        except (ValueError, TypeError, AttributeError, KeyError) as e:
+            last_err = str(e)[:200]
             if deadline - time.time() < 6:
                 break
     raise RuntimeError("planner produced no valid plan")
@@ -336,9 +377,11 @@ def apply_receipt(state, rc):
         if not isinstance(o, dict):
             return 422, {"error": "invalid outcome"}
         c = pending.get(o.get("callId"))
+        st = o.get("status")
+        status_ok = (isinstance(st, int) and not isinstance(st, bool)) or (st is None and o.get("errorType") is not None)
+        nonce_ok = o.get("nonce") is None or isinstance(o.get("nonce"), str)
         if (not c or o.get("actionId") != c["actionId"] or o.get("attempt") != c["attempts"][-1]["attempt"]
-                or o["callId"] in seen or not isinstance(o.get("status"), int) or isinstance(o.get("status"), bool)
-                or not isinstance(o.get("nonce"), str) or not o["nonce"]):
+                or o["callId"] in seen or not status_ok or not nonce_ok):
             return 422, {"error": "outcome does not match a pending call"}
         seen.add(o["callId"])
     ap = state.get("approval")
@@ -357,18 +400,20 @@ def apply_receipt(state, rc):
     for o in outcomes:
         call = pending[o["callId"]]
         att = call["attempts"][-1]
-        att.update({"receivedAt": now, "receiptId": rid, "nonce": o["nonce"], "status": o["status"]})
-        entry = {"receiptId": rid, "actionId": o["actionId"], "callId": o["callId"], "attempt": o["attempt"], "status": o["status"]}
+        st = o.get("status")
+        nonce = o.get("nonce") or ""
+        att.update({"receivedAt": now, "receiptId": rid, "nonce": nonce, "status": st})
+        entry = {"receiptId": rid, "actionId": o["actionId"], "callId": o["callId"], "attempt": o["attempt"], "status": st}
         if "resultClass" in o:
             entry["resultClass"] = o["resultClass"]
         if o.get("errorType") is not None:
             entry["errorType"] = o["errorType"]
             att["errorType"] = o["errorType"]
-        entry["nonce"] = o["nonce"]
+        entry["nonce"] = nonce
         state["receiptLog"].append(entry)
-        if 200 <= o["status"] < 300:
+        if st is not None and 200 <= st < 300:
             call["status"] = "succeeded"
-        elif o["status"] == 503 and not call["retried"]:
+        elif st == 503 and not call["retried"]:
             call["retried"] = True
             retries.append(make_dispatch(state, call, o["attempt"] + 1, state.get("effectExtras") if call["phase"] == "effect" else None))
         else:
@@ -448,7 +493,7 @@ def build_otlp(state):
     span("chat incident-plan", 3, plan, agent, state["planStart"], state["planEnd"],
          [("gen_ai.operation.name", "chat"), ("gen_ai.request.model", state["model"]), ("gen_ai.provider.name", "google")])
 
-    diag_spans, last_diag_end = [], 0
+    diag_spans, last_diag_recv = [], 0
     calls = list(state["calls"].values())
     if state["effect"].get("attempts"):
         calls.append(state["effect"])
@@ -461,7 +506,7 @@ def build_otlp(state):
               ("gen_ai.tool.call.id", c["callId"]), ("gen_ai.operation.name", "execute_tool")])
         if c["phase"] == "diagnostic":
             diag_spans.append(tool_span)
-            last_diag_end = max(last_diag_end, end)
+            last_diag_recv = max(last_diag_recv, max(a.get("receivedAt", a["dispatchedAt"]) for a in att))
         for a in att:
             status = a.get("status")
             attrs = [("ga5.action.id", c["actionId"]), ("ga5.attempt", a["attempt"]),
@@ -471,7 +516,11 @@ def build_otlp(state):
             if a.get("errorType") == "timeout" or status == 0:
                 attrs.append(("error.type", "timeout"))
                 code = 2
-            elif status is not None:
+            elif status is None:
+                if a.get("errorType"):
+                    attrs.append(("error.type", str(a["errorType"])))
+                    code = 2
+            else:
                 attrs.append(("http.response.status_code", status))
                 if not 200 <= status < 300:
                     attrs.append(("error.type", str(status)))
@@ -479,7 +528,9 @@ def build_otlp(state):
             span(f"POST tool/{c['toolName']}", 3, a["spanId"], tool_span, a["dispatchedAt"],
                  a.get("receivedAt", a["dispatchedAt"] + 1000), attrs, status=code)
     if len(diag_spans) >= 2:
-        span("incident.join", 1, sid(), agent, last_diag_end + 500, last_diag_end + 1500, [], links=diag_spans)
+        eff_att = state["effect"].get("attempts") or []
+        join_end = eff_att[0]["dispatchedAt"] if eff_att else tf
+        span("incident.join", 1, sid(), agent, last_diag_recv, join_end, [], links=diag_spans)
     ap = state.get("approval")
     if ap:
         end = ap.get("receivedAt", ap["requestedAt"] + 1000)
@@ -622,9 +673,15 @@ def get_incident(run_id: str):
     return JSONResponse(state["current"])
 
 
-# ---------------- diagnostics for you (no request bodies are ever logged) ----------------
+# ---------------- diagnostics for you (need ?token=SELFTEST_TOKEN; no request bodies are ever logged) ----------------
+def token_ok(token):
+    return bool(SELFTEST_TOKEN) and secrets.compare_digest(token or "", SELFTEST_TOKEN)
+
+
 @app.get("/selftest")
-def selftest():
+def selftest(token: str = ""):
+    if not token_ok(token):
+        return err(403, "forbidden")
     out = {}
     try:
         kput("selftest", {"t": time.time()})
@@ -632,6 +689,7 @@ def selftest():
     except Exception as e:
         out["database"] = "ERROR: " + str(e)[:300]
     out["gemini_key_set"] = bool(GEMINI_KEY)
+    out["models"] = model_list()
     t = time.time()
     try:
         r, m = gemini_json([{"text": 'Return only this JSON: {"ok": true}'}], time.time() + 20)
@@ -643,8 +701,10 @@ def selftest():
 
 
 @app.get("/selftest/models")
-def selftest_models():
-    """Times several candidate models in parallel (about 15 seconds), so you can pick the fastest working one."""
+def selftest_models(token: str = ""):
+    """Times several candidate models in parallel (about 15 seconds)."""
+    if not token_ok(token):
+        return err(403, "forbidden")
     from concurrent.futures import ThreadPoolExecutor
     cands = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-lite-latest",
              "gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest"]
@@ -667,7 +727,10 @@ def selftest_models():
 
 
 @app.get("/debug/errors")
-def debug_errors():
+def debug_errors(token: str = ""):
+    if not token_ok(token):
+        return err(403, "forbidden")
+    ensure_table()
     rows = run("SELECT v FROM kv WHERE k LIKE ?", (P + "log:%",), True)
     logs = sorted((json.loads(r[0]) for r in rows), key=lambda x: x["ts"], reverse=True)[:30]
     return logs
