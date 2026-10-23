@@ -527,7 +527,7 @@ def build_otlp(state):
                     code = 2
             span(f"POST tool/{c['toolName']}", 3, a["spanId"], tool_span, a["dispatchedAt"],
                  a.get("receivedAt", a["dispatchedAt"] + 1000), attrs, status=code)
-    if len(diag_spans) >= 2:
+    if len(diag_spans) >= 1:
         eff_att = state["effect"].get("attempts") or []
         join_end = eff_att[0]["dispatchedAt"] if eff_att else tf
         span("incident.join", 1, sid(), agent, last_diag_recv, join_end, [], links=diag_spans)
